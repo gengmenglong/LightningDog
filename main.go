@@ -1,89 +1,121 @@
 package main
 
 import (
-	"context"
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
-	"log"
 	"math/big"
-	"sync"
-
-	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/ethclient"
-	"github.com/ethereum/go-ethereum/rpc"
+	"time"
 )
 
 // 优化点 1：定义工作池大小，限制并发数，保护 API 不被封
-const workerCount = 5
+// const workerCount = 5
+type Block struct {
+	Timestamp     int64    // 时间戳
+	Data          []byte   // 交易数据（第一步先用简单的字符串代替）
+	PrevBlockHash []byte   // 前一个区块的哈希值
+	Hash          []byte   // 当前区块的哈希值
+	Nonce         int      // 随机数
+	Difficulty    int      // 难度
+	Target        *big.Int // 目标值
+}
+type BlockChain struct {
+	Blocks []*Block
+}
 
-func main() {
-	// wssUrl := "wss://eth-mainnet.g.alchemy.com/v2/你的APIKey"
-	wssUrl := "wss://eth-mainnet.g.alchemy.com/v2/SCz3YIdYkR5bXVwawzgbo"
-	rpcClient, _ := rpc.Dial(wssUrl)
-	client := ethclient.NewClient(rpcClient)
+const targetBits = 17 // 难度值：代表哈希值前导零的位数（这里数值越大越难）
+type ProofOfWork struct {
+	block  *Block
+	target *big.Int // 目标值：算出来的哈希必须比这个数小
+}
 
-	txHashes := make(chan common.Hash, 1000) // 带缓冲的通道
-	var wg sync.WaitGroup
-
-	// 优化点 2：启动固定数量的协程 (Workers)
-	for i := 0; i < workerCount; i++ {
-		wg.Add(1)
-		go func(workerID int) {
-			defer wg.Done()
-			for hash := range txHashes {
-				// 在这里执行查询动作
-				tx, isPending, err := client.TransactionByHash(context.Background(), hash)
-				if err != nil || !isPending {
-					continue
-				}
-				// 逻辑过滤：比如只关心转账金额 > 1 ETH 的交易
-				oneEth := new(big.Int)
-				oneEth.SetString("1000000000000000000", 10) // 1 ETH = 10^18 wei
-				// if tx.Value().Cmp(oneEth) > 0 {
-				// 	fmt.Printf("[Worker %d] 捕获大额交易: %s\n", workerID, hash.Hex())
-				// }
-				// 改进后的打印逻辑
-				if tx.Value().Cmp(oneEth) > 0 {
-					// 1. 获取发送者地址 (需要计算，因为 tx 里存的是签名)
-					// 这里的 chainID 建议在程序初始化时获取，主网通常是 1
-					signer := types.LatestSignerForChainID(big.NewInt(1))
-					from, _ := types.Sender(signer, tx)
-
-					// 2. 转换金额单位 (从 Wei 转为 ETH)
-					fAmount := new(big.Float).SetInt(tx.Value())
-					ethValue := new(big.Float).Quo(fAmount, big.NewFloat(1e18))
-
-					fmt.Printf("\n--- [Worker %d] 发现大鱼！ ---\n", workerID)
-					fmt.Printf("交易哈希: %s\n", tx.Hash().Hex())
-					fmt.Printf("发送方: %s\n", from.Hex())
-					if tx.To() != nil {
-						fmt.Printf("接收方: %s\n", tx.To().Hex())
-					}
-					fmt.Printf("金额: %.4f ETH\n", ethValue)
-					fmt.Printf("Gas 价格: %v Gwei\n", tx.GasPrice().Uint64()/1e9)
-					fmt.Println("---------------------------")
-				}
-			}
-		}(i)
-	}
-
-	// 3. 订阅哈希流
-	subHashes := make(chan common.Hash)
-	sub, _ := rpcClient.EthSubscribe(context.Background(), subHashes, "newPendingTransactions")
-
-	fmt.Println("🚀 优化后的观察者已启动...")
-
-	for {
-		select {
-		case err := <-sub.Err():
-			log.Fatal(err)
-		case hash := <-subHashes:
-			// 优化点 3：非阻塞地将哈希扔进任务队列
-			select {
-			case txHashes <- hash:
-			default:
-				// 如果队列满了，丢弃该哈希，防止程序卡死
-			}
+func NewProofOfWork(b *Block) *ProofOfWork {
+	target := big.NewInt(1)
+	fmt.Println(target)
+	target.Lsh(target, uint(256-b.Difficulty))
+	fmt.Println(target)
+	pow := &ProofOfWork{b, target}
+	return pow
+}
+func (pow *ProofOfWork) prepareData(nonce int) []byte {
+	data := bytes.Join([][]byte{
+		pow.block.PrevBlockHash,
+		pow.block.Data,
+		big.NewInt(pow.block.Timestamp).Bytes(),
+		big.NewInt(int64(nonce)).Bytes(),
+		big.NewInt(int64(targetBits)).Bytes(),
+	}, []byte{})
+	return data
+}
+func (pow *ProofOfWork) Run() (int, []byte) {
+	var hashInt big.Int
+	var hash [32]byte
+	nonce := 0
+	fmt.Printf("开始挖掘包含数据 \"%s\" 的区块\n", pow.block.Data)
+	for nonce < 100000000 { // 设置一个足够大的上限
+		data := pow.prepareData(nonce)
+		hash = sha256.Sum256(data) // 计算哈希
+		fmt.Printf("\r%x", hash)   // 实时打印哈希值（可选）
+		hashInt.SetBytes(hash[:])
+		if hashInt.Cmp(pow.target) == -1 {
+			break
 		}
+		nonce++
+	}
+	fmt.Print("\n\n")
+	return nonce, hash[:]
+}
+func NewBlockChain() *BlockChain {
+	return &BlockChain{
+		Blocks: []*Block{
+			&Block{Data: []byte("Genesis Block")},
+		},
+	}
+}
+func (bc *BlockChain) AddBlock(data string) {
+	prevBlock := bc.Blocks[len(bc.Blocks)-1]
+	newBlock := &Block{
+		Timestamp:     time.Now().Unix(),
+		Data:          []byte(data),
+		PrevBlockHash: prevBlock.Hash,
+		Nonce:         0,
+		Difficulty:    targetBits,
+	}
+	// SetHash(newBlock)
+	pow := NewProofOfWork(newBlock)
+	nonce, hash := pow.Run()
+	newBlock.Hash = hash[:]
+	newBlock.Nonce = nonce
+	bc.Blocks = append(bc.Blocks, newBlock)
+}
+
+// 编写一个 SetHash 方法。将 PrevBlockHash + Data + Timestamp 拼接后进行 SHA-256 运算。
+func SetHash(block *Block) {
+	hash := sha256.New()
+	hash.Write(block.PrevBlockHash)
+	hash.Write(block.Data)
+	hash.Write(big.NewInt(block.Timestamp).Bytes())
+	block.Hash = hash.Sum(nil)
+}
+func main() {
+	block := &Block{
+		Timestamp:     1234567890,
+		Data:          []byte("test"),
+		PrevBlockHash: []byte("prevHash"),
+	}
+	SetHash(block)
+	fmt.Println(hex.EncodeToString(block.Hash))
+	bc := NewBlockChain()
+	bc.AddBlock("Send 1 BTC to Ivan")
+	bc.AddBlock("Send 2 more BTC to Ivan")
+	for _, block := range bc.Blocks {
+		fmt.Printf("Prev. hash: %x\n", block.PrevBlockHash)
+		fmt.Printf("Data: %s\n", block.Data)
+		fmt.Printf("Hash: %x\n", block.Hash)
+		fmt.Printf("Nonce: %d\n", block.Nonce)
+		fmt.Printf("Difficulty: %d\n", block.Difficulty)
+		fmt.Printf("Target: %x\n", block.Target)
+		fmt.Println()
 	}
 }
